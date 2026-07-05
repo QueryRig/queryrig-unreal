@@ -1,0 +1,9 @@
+{
+  "api_key": "test-key",
+  "endpoint": "http://127.0.0.1:8788/v1/events",
+  "enabled": "remote",
+  "flush_interval_s": 5,
+  "flush_max_events": 100,
+  "disk_queue_max_bytes": 8388608,
+  "sample_rate": 1.0
+}

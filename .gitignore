@@ -1,0 +1,10 @@
+# Unreal build artifacts
+Binaries/
+Intermediate/
+DerivedDataCache/
+Saved/
+.vs/
+*.sln
+
+# Local telemetry config (ship per-environment copies, don't commit real keys)
+queryrig.json

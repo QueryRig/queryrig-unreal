@@ -1,0 +1,21 @@
+{
+	"FileVersion": 3,
+	"Version": 1,
+	"VersionName": "0.1.0",
+	"FriendlyName": "QueryRig",
+	"Description": "QueryRig game analytics SDK — batched, durable event tracking with a runtime on/off switch.",
+	"Category": "Analytics",
+	"CreatedBy": "QueryRig",
+	"CreatedByURL": "https://github.com/prhym/queryrig",
+	"DocsURL": "https://github.com/prhym/queryrig-unreal",
+	"EnabledByDefault": true,
+	"CanContainContent": false,
+	"IsBetaVersion": true,
+	"Modules": [
+		{
+			"Name": "QueryRig",
+			"Type": "Runtime",
+			"LoadingPhase": "Default"
+		}
+	]
+}
