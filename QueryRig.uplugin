@@ -16,6 +16,11 @@
 			"Name": "QueryRig",
 			"Type": "Runtime",
 			"LoadingPhase": "Default"
+		},
+		{
+			"Name": "QueryRigConformance",
+			"Type": "Editor",
+			"LoadingPhase": "Default"
 		}
 	]
 }

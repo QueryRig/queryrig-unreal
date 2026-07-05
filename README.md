@@ -88,6 +88,20 @@ Run the SDK conformance harness from the queryrig repo (`npm run
 sdk-harness`, port 8788) and point `Saved/Config/queryrig.json` at
 `http://127.0.0.1:8788/v1/events` with key `test-key`.
 
+## Conformance test
+
+The plugin ships an editor-only `QueryRigConformance` module (never packaged
+into games) with a commandlet that exercises the spec end to end. With the
+harness running and any C++ host project that enables the plugin:
+
+```
+UnrealEditor-Cmd.exe <Host.uproject> -run=QueryRigConformance -unattended -nullrhi -nosplash -stdout
+```
+
+Covers delivery + stamping, an outage (zero loss, zero duplicates after
+disk-queue replay), the remote kill switch both directions, and hard-off
+silence. Exit code 0 on pass, 2 if the harness is unreachable.
+
 ## Packaging
 
 Build a distributable (prebuilt binaries, usable by Blueprint-only projects):
