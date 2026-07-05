@@ -25,7 +25,21 @@ projects can use a prebuilt package (see Packaging below).
 
 ## Use
 
-C++ (`"QueryRig"` in your module's dependencies):
+**Blueprint — no C++ required.** In any Blueprint graph with a World Context
+(a level Blueprint, a widget, an actor), open the node search and type
+"QueryRig". Drag in **QueryRig: Track Event**, set the *Event Name* pin (e.g.
+`level_complete`) and add entries to the *Properties* map (e.g. `level` → `3`,
+`duration_s` → `82.5`). That's the whole integration — one node, no subsystem
+to fetch first. Values that parse as numbers or `true`/`false` are sent typed;
+everything else is sent as a string.
+
+The same search also surfaces **QueryRig: Set Player Id** (override the
+default device-derived id, e.g. with a platform account id), **QueryRig:
+Flush** (force an immediate send), **QueryRig: Refresh Gate** (re-check the
+remote on/off switch now), and **QueryRig: Is Enabled** (for a debug HUD).
+
+C++ (`"QueryRig"` in your module's dependencies) — equivalent to the
+Blueprint node above, for code-driven projects:
 
 ```cpp
 #include "QueryRigSubsystem.h"
@@ -36,10 +50,6 @@ Props->SetNumberField(TEXT("level"), 3);
 Props->SetNumberField(TEXT("duration_s"), 82.5);
 Rig->Track(TEXT("level_complete"), Props);
 ```
-
-Blueprint: get the **QueryRig** subsystem from your Game Instance and call
-**Track Event** (map values that parse as numbers/booleans are sent typed),
-**Set Player Id**, **Flush**, or **Is Enabled**.
 
 `session_id`, `player_id`, `platform`, `build_version`, `timestamp`, and
 `event_id` are stamped automatically (explicit properties win).
