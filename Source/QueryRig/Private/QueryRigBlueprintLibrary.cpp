@@ -24,6 +24,14 @@ void UQueryRigBlueprintLibrary::TrackEvent(const UObject* WorldContextObject, co
 	}
 }
 
+void UQueryRigBlueprintLibrary::TrackFields(const UObject* WorldContextObject, const TMap<FString, FString>& Fields)
+{
+	if (UQueryRigSubsystem* Rig = GetSubsystem(WorldContextObject))
+	{
+		Rig->TrackFieldMap(Fields);
+	}
+}
+
 void UQueryRigBlueprintLibrary::SetQueryRigPlayerId(const UObject* WorldContextObject, const FString& PlayerId)
 {
 	if (UQueryRigSubsystem* Rig = GetSubsystem(WorldContextObject))

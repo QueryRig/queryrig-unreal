@@ -219,42 +219,63 @@ int32 UQueryRigConformanceCommandlet::Main(const FString& Params)
 		Phase.Rig->Track(TEXT("level_complete"), MakeProps({{TEXT("level"), 3}, {TEXT("duration_s"), 82.5}}));
 		Phase.Rig->Track(TEXT("item_pickup"), nullptr);
 		Phase.Rig->Track(TEXT("enemy_killed"), nullptr);
+		// No event_name at all: nothing is reserved, so an event is any set of
+		// fields. Proves the server accepts the studio's own vocabulary — and
+		// goes through the Blueprint path, which sends values verbatim.
+		TMap<FString, FString> BossFields;
+		BossFields.Add(TEXT("kind"), TEXT("boss_defeated"));
+		BossFields.Add(TEXT("boss"), TEXT("warden"));
+		Phase.Rig->TrackFieldMap(BossFields);
 		Phase.Rig->Flush();
 
-		// 3 tracked + the automatic session_start.
-		Check(WaitUntil([] { return HarnessRows() >= 4; }, 5.0), TEXT("delivery: 4 rows arrive after flush"));
+		// 4 tracked + the automatic session_start.
+		Check(WaitUntil([] { return HarnessRows() >= 5; }, 5.0), TEXT("delivery: 5 rows arrive after flush"));
 
 		TSet<FString> Names, Sessions, Ids;
 		bool bStamped = true;
-		TSharedPtr<FJsonObject> LevelRow;
+		TSharedPtr<FJsonObject> LevelProps, UnnamedProps;
 		for (const TSharedPtr<FJsonValue>& Value : ReqArray(TEXT("/__harness/rows")))
 		{
 			const TSharedPtr<FJsonObject>* Row;
-			if (!Value->TryGetObject(Row))
+			const TSharedPtr<FJsonObject>* Props;
+			// Only timestamp/received_at/event_id (+ project_id) are columns;
+			// every other field lands in `properties` under its own name.
+			if (!Value->TryGetObject(Row) || !(*Row)->TryGetObjectField(TEXT("properties"), Props))
 			{
 				continue;
 			}
-			Names.Add((*Row)->GetStringField(TEXT("event_name")));
-			Sessions.Add((*Row)->GetStringField(TEXT("session_id")));
+			const FString Name = (*Props)->HasField(TEXT("event_name"))
+				? (*Props)->GetStringField(TEXT("event_name")) : FString();
+			Names.Add(Name);
+			Sessions.Add((*Props)->GetStringField(TEXT("session_id")));
 			bool bUnique = false;
 			Ids.Add((*Row)->GetStringField(TEXT("event_id")), &bUnique);
-			bStamped = bStamped && !(*Row)->GetStringField(TEXT("player_id")).IsEmpty()
-				&& !(*Row)->GetStringField(TEXT("platform")).IsEmpty();
-			if ((*Row)->GetStringField(TEXT("event_name")) == TEXT("level_complete"))
+			bStamped = bStamped && !(*Props)->GetStringField(TEXT("player_id")).IsEmpty()
+				&& !(*Props)->GetStringField(TEXT("platform")).IsEmpty();
+			if (Name == TEXT("level_complete"))
 			{
-				LevelRow = *Row;
+				LevelProps = *Props;
+			}
+			else if (Name.IsEmpty())
+			{
+				UnnamedProps = *Props;
 			}
 		}
 		Check(Names.Contains(TEXT("session_start")) && Names.Contains(TEXT("level_complete")),
 			TEXT("delivery: session_start + tracked events present"));
 		Check(bStamped, TEXT("stamping: player_id + platform set on every row"));
 		Check(Sessions.Num() == 1, TEXT("stamping: one session_id across the batch"));
-		Check(Ids.Num() == 4, TEXT("stamping: event_ids unique"));
-		const TSharedPtr<FJsonObject>* LevelProps = nullptr;
-		Check(LevelRow.IsValid() && LevelRow->TryGetObjectField(TEXT("properties"), LevelProps)
-			&& FMath::IsNearlyEqual((*LevelProps)->GetNumberField(TEXT("level")), 3.0)
-			&& FMath::IsNearlyEqual((*LevelProps)->GetNumberField(TEXT("duration_s")), 82.5),
-			TEXT("stamping: properties survive normalization"));
+		Check(Ids.Num() == 5, TEXT("stamping: event_ids unique"));
+		Check(UnnamedProps.IsValid()
+			&& UnnamedProps->GetStringField(TEXT("kind")) == TEXT("boss_defeated")
+			&& UnnamedProps->GetStringField(TEXT("boss")) == TEXT("warden"),
+			TEXT("fields: an event with no event_name is accepted and keeps its own fields"));
+		// Every property scalar is stored as a string, whatever the client sent
+		// — one type per path, so equality in a query always works.
+		Check(LevelProps.IsValid()
+			&& LevelProps->GetStringField(TEXT("level")) == TEXT("3")
+			&& LevelProps->GetStringField(TEXT("duration_s")) == TEXT("82.5"),
+			TEXT("stamping: property values arrive as strings"));
 
 		bool bUserAgent = false;
 		for (const TSharedPtr<FJsonValue>& Value : ReqArray(TEXT("/__harness/requests")))

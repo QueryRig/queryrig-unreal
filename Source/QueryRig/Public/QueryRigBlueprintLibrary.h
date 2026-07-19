@@ -19,9 +19,13 @@ class QUERYRIG_API UQueryRigBlueprintLibrary : public UBlueprintFunctionLibrary
 	GENERATED_BODY()
 
 public:
-	/** Queue an analytics event. Values that parse as numbers/true/false are sent typed. */
+	/** Queue an analytics event under a name. Property values are sent verbatim. */
 	UFUNCTION(BlueprintCallable, Category = "QueryRig", meta = (WorldContext = "WorldContextObject", AutoCreateRefTerm = "Properties", DisplayName = "QueryRig: Track Event"))
 	static void TrackEvent(const UObject* WorldContextObject, const FString& EventName, const TMap<FString, FString>& Properties);
+
+	/** Queue an event with no name — every key is a field of your own. */
+	UFUNCTION(BlueprintCallable, Category = "QueryRig", meta = (WorldContext = "WorldContextObject", AutoCreateRefTerm = "Fields", DisplayName = "QueryRig: Track Fields"))
+	static void TrackFields(const UObject* WorldContextObject, const TMap<FString, FString>& Fields);
 
 	/** Override the default (device-derived) player id, e.g. with a platform account id. */
 	UFUNCTION(BlueprintCallable, Category = "QueryRig", meta = (WorldContext = "WorldContextObject", DisplayName = "QueryRig: Set Player Id"))

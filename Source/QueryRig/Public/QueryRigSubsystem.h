@@ -34,15 +34,32 @@ public:
 	virtual void Deinitialize() override;
 	//~ End UGameInstanceSubsystem
 
-	/** Queue an event with full JSON properties (C++). Cheap; never blocks on I/O. */
+	/**
+	 * Queue an event under a name, with full JSON properties (C++). Cheap;
+	 * never blocks on I/O. The name is sent as the `event_name` field, which
+	 * the dashboard's query templates look for by default — a convention, not
+	 * a requirement.
+	 */
 	void Track(const FString& EventName, TSharedPtr<FJsonObject> Properties = nullptr);
 
 	/**
-	 * Queue an event (Blueprint). Property values that parse as numbers or
-	 * true/false are sent as numbers/booleans; everything else as strings.
+	 * Queue an event with no name (C++) — the fields are entirely yours.
+	 * Nothing is reserved server-side: an event is any set of fields, and the
+	 * only rule is that it carries at least one.
 	 */
+	void TrackFields(TSharedPtr<FJsonObject> Fields);
+
+	/** Queue an event under a name (Blueprint). Values are sent verbatim. */
 	UFUNCTION(BlueprintCallable, Category = "QueryRig", meta = (AutoCreateRefTerm = "Properties"))
 	void TrackEvent(const FString& EventName, const TMap<FString, FString>& Properties);
+
+	/**
+	 * Queue an event with no name (Blueprint) — every key is a field of your
+	 * own. Point the dashboard's query templates at whichever of them names
+	 * the event.
+	 */
+	UFUNCTION(BlueprintCallable, Category = "QueryRig", meta = (AutoCreateRefTerm = "Fields", DisplayName = "Track Fields"))
+	void TrackFieldMap(const TMap<FString, FString>& Fields);
 
 	/** Override the default (device-derived) player id, e.g. with a platform account id. */
 	UFUNCTION(BlueprintCallable, Category = "QueryRig")
@@ -111,7 +128,8 @@ private:
 	void EndSession();
 
 	// Queueing
-	TSharedPtr<FJsonObject> Stamp(const FString& EventName, const TSharedPtr<FJsonObject>& Properties);
+	static TSharedPtr<FJsonObject> MapToJson(const TMap<FString, FString>& Fields);
+	TSharedPtr<FJsonObject> Stamp(const TSharedPtr<FJsonObject>& Properties);
 	void Enqueue(const TSharedPtr<FJsonObject>& Event);
 	bool IsCollecting() const;
 	bool OnFlushTick(float DeltaTime);

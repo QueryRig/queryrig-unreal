@@ -130,6 +130,20 @@ void UQueryRigSubsystem::Deinitialize()
 
 void UQueryRigSubsystem::Track(const FString& EventName, TSharedPtr<FJsonObject> Properties)
 {
+	const TSharedPtr<FJsonObject> Fields = MakeShared<FJsonObject>();
+	if (Properties.IsValid())
+	{
+		for (const TPair<FString, TSharedPtr<FJsonValue>>& Pair : Properties->Values)
+		{
+			Fields->SetField(Pair.Key, Pair.Value);
+		}
+	}
+	Fields->SetStringField(TEXT("event_name"), EventName);
+	TrackFields(Fields);
+}
+
+void UQueryRigSubsystem::TrackFields(TSharedPtr<FJsonObject> Fields)
+{
 	if (bInert || !IsCollecting() || !bSampledIn)
 	{
 		return;
@@ -140,32 +154,36 @@ void UQueryRigSubsystem::Track(const FString& EventName, TSharedPtr<FJsonObject>
 		StartSession(); // 30-minute idle rollover (spec §3.5)
 	}
 	LastEventMs = Now;
-	Enqueue(Stamp(EventName, Properties));
+	Enqueue(Stamp(Fields));
 }
 
 void UQueryRigSubsystem::TrackEvent(const FString& EventName, const TMap<FString, FString>& Properties)
 {
-	TSharedPtr<FJsonObject> Props;
-	if (Properties.Num() > 0)
+	Track(EventName, MapToJson(Properties));
+}
+
+void UQueryRigSubsystem::TrackFieldMap(const TMap<FString, FString>& Fields)
+{
+	TrackFields(MapToJson(Fields));
+}
+
+// Blueprint hands us strings, so strings are what we send. Guessing at numbers
+// here would only corrupt them: the server coerces every scalar to a string
+// anyway (one type per field, so queries are predictable), and round-tripping
+// through a double first loses leading zeros, trailing zeros in a version like
+// "1.10", and precision on ids longer than 15 digits.
+TSharedPtr<FJsonObject> UQueryRigSubsystem::MapToJson(const TMap<FString, FString>& Fields)
+{
+	if (Fields.Num() == 0)
 	{
-		Props = MakeShared<FJsonObject>();
-		for (const TPair<FString, FString>& Pair : Properties)
-		{
-			if (Pair.Value.IsNumeric())
-			{
-				Props->SetNumberField(Pair.Key, FCString::Atod(*Pair.Value));
-			}
-			else if (Pair.Value == TEXT("true") || Pair.Value == TEXT("false"))
-			{
-				Props->SetBoolField(Pair.Key, Pair.Value == TEXT("true"));
-			}
-			else
-			{
-				Props->SetStringField(Pair.Key, Pair.Value);
-			}
-		}
+		return nullptr;
 	}
-	Track(EventName, Props);
+	const TSharedPtr<FJsonObject> Props = MakeShared<FJsonObject>();
+	for (const TPair<FString, FString>& Pair : Fields)
+	{
+		Props->SetStringField(Pair.Key, Pair.Value);
+	}
+	return Props;
 }
 
 void UQueryRigSubsystem::SetPlayerId(const FString& InPlayerId)
@@ -316,7 +334,9 @@ void UQueryRigSubsystem::StartSession()
 	bSampledIn = static_cast<int32>((GetTypeHash(SessionId) & 0x7fffffff) % 10000) < static_cast<int32>(Rate * 10000.0);
 	if (bSampledIn && IsCollecting())
 	{
-		Enqueue(Stamp(TEXT("session_start"), nullptr));
+		const TSharedPtr<FJsonObject> Props = MakeShared<FJsonObject>();
+		Props->SetStringField(TEXT("event_name"), TEXT("session_start"));
+		Enqueue(Stamp(Props));
 	}
 }
 
@@ -327,15 +347,20 @@ void UQueryRigSubsystem::EndSession()
 		return;
 	}
 	const TSharedPtr<FJsonObject> Props = MakeShared<FJsonObject>();
+	Props->SetStringField(TEXT("event_name"), TEXT("session_end"));
 	Props->SetNumberField(TEXT("duration_s"), (NowMs() - SessionStartMs) / 1000.0);
-	Enqueue(Stamp(TEXT("session_end"), Props));
+	Enqueue(Stamp(Props));
 }
 
 // ---------------------------------------------------------------- queueing
 
 // Stamp everything at enqueue time (spec §3.3) so retries can't change the
 // event. Explicit values in the properties win over SDK defaults.
-TSharedPtr<FJsonObject> UQueryRigSubsystem::Stamp(const FString& EventName, const TSharedPtr<FJsonObject>& Properties)
+//
+// Values go out as their natural JSON types; the server coerces every scalar to
+// a string so each field has one predictable type to query. Never pre-stringify
+// here — that would lose the distinction between "not sent" and "sent empty".
+TSharedPtr<FJsonObject> UQueryRigSubsystem::Stamp(const TSharedPtr<FJsonObject>& Properties)
 {
 	const TSharedPtr<FJsonObject> Event = MakeShared<FJsonObject>();
 	if (Properties.IsValid())
@@ -345,7 +370,6 @@ TSharedPtr<FJsonObject> UQueryRigSubsystem::Stamp(const FString& EventName, cons
 			Event->SetField(Pair.Key, Pair.Value);
 		}
 	}
-	Event->SetStringField(TEXT("event_name"), EventName);
 	if (!Event->HasField(TEXT("event_id")))
 	{
 		Event->SetStringField(TEXT("event_id"), NewUuid());

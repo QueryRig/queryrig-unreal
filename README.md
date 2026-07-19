@@ -30,13 +30,15 @@ projects can use a prebuilt package (see Packaging below).
 "QueryRig". Drag in **QueryRig: Track Event**, set the *Event Name* pin (e.g.
 `level_complete`) and add entries to the *Properties* map (e.g. `level` → `3`,
 `duration_s` → `82.5`). That's the whole integration — one node, no subsystem
-to fetch first. Values that parse as numbers or `true`/`false` are sent typed;
-everything else is sent as a string.
+to fetch first. Values are sent exactly as typed: the server stores every
+property as text, so a build number like `1.10` or an id with leading zeros
+survives intact.
 
-The same search also surfaces **QueryRig: Set Player Id** (override the
-default device-derived id, e.g. with a platform account id), **QueryRig:
-Flush** (force an immediate send), **QueryRig: Refresh Gate** (re-check the
-remote on/off switch now), and **QueryRig: Is Enabled** (for a debug HUD).
+The same search also surfaces **QueryRig: Track Fields** (an event with no
+name — see below), **QueryRig: Set Player Id** (override the default
+device-derived id, e.g. with a platform account id), **QueryRig: Flush**
+(force an immediate send), **QueryRig: Refresh Gate** (re-check the remote
+on/off switch now), and **QueryRig: Is Enabled** (for a debug HUD).
 
 C++ (`"QueryRig"` in your module's dependencies) — equivalent to the
 Blueprint node above, for code-driven projects:
@@ -55,6 +57,29 @@ Rig->Track(TEXT("level_complete"), Props);
 `event_id` are stamped automatically (explicit properties win).
 `session_start` / `session_end` events are emitted for you, with a 30-minute
 idle rollover.
+
+### Your fields, your names
+
+Nothing is reserved. Apart from `timestamp` and `event_id`, every field you
+send is stored under the name you gave it — including `event_name`, which is
+just the name the dashboard's query templates look for by default. If your
+game already has its own vocabulary, send it and skip the event name entirely
+with **QueryRig: Track Fields**, or in C++:
+
+```cpp
+TSharedPtr<FJsonObject> Fields = MakeShared<FJsonObject>();
+Fields->SetStringField(TEXT("kind"), TEXT("boss_defeated"));
+Fields->SetStringField(TEXT("boss"), TEXT("warden"));
+Rig->TrackFields(Fields);
+```
+
+Then point the templates at `kind` instead of `event_name` (every template
+takes the field name). Use `Track()` when you have no reason not to — matching
+the convention means charts work with no configuration.
+
+Values are stored as text, so query them quoted (`properties.level = '3'`) and
+cast when you need arithmetic (`toInt64OrNull(toString(properties.level))`).
+Send natural JSON types from C++ — the conversion happens server-side.
 
 ## Configure
 
