@@ -13,10 +13,10 @@
  * Design contract, in order:
  *  1. Telemetry behavior is a runtime decision — config file, env var, or the
  *     remote gate. Never a rebuild.
- *  2. Accepted events are never lost: memory queue -> disk spill -> replay,
- *     with client-generated event_ids so retries are dedupe-safe server-side.
- *  3. Track() never costs a frame: it stamps and enqueues; HTTP is async and
- *     delivery failures go to disk.
+ *  2. Persist batches before sending; preserve identity for retries.
+ *     Caps, crashes before persistence, and disk failures can lose events.
+ *  3. Game-thread tracking validates and serializes. Disk writes occur on
+ *     flush, also on the game thread; HTTP is async.
  *
  * Usage (auto-instantiated per game instance):
  *   GetGameInstance()->GetSubsystem<UQueryRigSubsystem>()->Track(
@@ -35,8 +35,8 @@ public:
 	//~ End UGameInstanceSubsystem
 
 	/**
-	 * Queue an event under a name, with full JSON properties (C++). Cheap;
-	 * never blocks on I/O. The name is sent as the `event_name` field, which
+	 * Queue an event under a name, with full JSON properties (C++), on the game
+	 * thread. Threshold flushes can write to disk. The `event_name` field is what
 	 * the dashboard's query templates look for by default — a convention, not
 	 * a requirement.
 	 */
@@ -65,7 +65,7 @@ public:
 	UFUNCTION(BlueprintCallable, Category = "QueryRig")
 	void SetPlayerId(const FString& InPlayerId);
 
-	/** Force an immediate flush (asynchronous — returns at once). */
+	/** Persist queued events, then start asynchronous HTTP. Disk I/O is synchronous. */
 	UFUNCTION(BlueprintCallable, Category = "QueryRig")
 	void Flush();
 
@@ -98,6 +98,9 @@ private:
 	bool bDormant = false; // 401 or gate-off: drop new events, keep disk queue
 	bool bSampledIn = true;
 	bool bRequestInFlight = false;
+	bool bShuttingDown = false;
+	FString QueueNamespace;
+	TSharedPtr<class IHttpRequest, ESPMode::ThreadSafe> ActiveRequest;
 
 	FString SessionId;
 	int64 SessionStartMs = 0;
@@ -105,8 +108,8 @@ private:
 	FString PlayerId;
 	FString CachedBuildVersion;
 
-	// Memory queue. Guarded: Track() is callable from any thread.
-	TArray<TSharedPtr<FJsonObject>> Queue;
+	// Immutable serialized events; session and tracking state are game-thread-only.
+	TArray<FString> Queue;
 	FCriticalSection QueueLock;
 	int32 DroppedOverflow = 0;
 
@@ -143,7 +146,8 @@ private:
 	// Disk queue
 	FString DataDir() const;
 	FString QueueDir() const;
-	void SpillToDisk(const TArray<FString>& Lines);
+	bool SpillToDisk(const TArray<FString>& Lines);
+	void PersistQueue();
 	void EnforceDiskCap();
 	void DrainDiskOne();
 	void AppendRejected(const TArray<FString>& Lines);

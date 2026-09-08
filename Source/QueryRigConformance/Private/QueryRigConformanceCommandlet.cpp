@@ -309,6 +309,55 @@ int32 UQueryRigConformanceCommandlet::Main(const FString& Params)
 			TEXT("outage: replay produced no duplicates"));
 	}
 
+	// ---- Regression: immutable payloads, UTF-8 batches, and shutdown during HTTP.
+	Req(TEXT("POST"), TEXT("/__harness/mode"), TEXT("{\"events\":\"hang\"}"));
+	{
+		FPhase Phase(TEXT("true"));
+		TSharedPtr<FJsonObject> Nested = MakeShared<FJsonObject>();
+		Nested->SetStringField(TEXT("value"), TEXT("before"));
+		TSharedPtr<FJsonObject> Props = MakeShared<FJsonObject>();
+		Props->SetObjectField(TEXT("nested"), Nested);
+		Phase.Rig->Track(TEXT("immutable_regression"), Props);
+		Nested->SetStringField(TEXT("value"), TEXT("after"));
+		for (int32 i = 0; i < 90; ++i)
+		{
+			TSharedPtr<FJsonObject> Unicode = MakeShared<FJsonObject>();
+			Unicode->SetStringField(TEXT("text"), FString::ChrN(1000, TCHAR(0x4E2D)));
+			Phase.Rig->Track(TEXT("unicode_regression"), Unicode);
+		}
+		Phase.Rig->Flush();
+		Pump(0.3); // request remains unacknowledged while the game shuts down
+		Phase.Rig->Track(TEXT("pending_shutdown_regression"), nullptr);
+	}
+	{
+		TArray<FString> Files;
+		IFileManager::Get().FindFilesRecursive(Files, *FPaths::ProjectSavedDir(), TEXT("*.ndjson"), true, false);
+		int32 UnicodeCount = 0;
+		bool bImmutable = false, bPending = false, bSizeValid = true;
+		for (const FString& File : Files)
+		{
+			TArray<FString> Lines;
+			FFileHelper::LoadFileToStringArray(Lines, *File);
+			const FString Body = TEXT("[") + FString::Join(Lines, TEXT(",")) + TEXT("]");
+			bSizeValid &= FTCHARToUTF8(*Body).Length() <= 200000 && Lines.Num() <= 500;
+			for (const FString& Line : Lines)
+			{
+				TSharedPtr<FJsonObject> Event;
+				if (!FJsonSerializer::Deserialize(TJsonReaderFactory<TCHAR>::Create(Line), Event)) continue;
+				FString Name;
+				if (!Event->TryGetStringField(TEXT("event_name"), Name)) continue;
+				if (Name == TEXT("unicode_regression")) ++UnicodeCount;
+				if (Name == TEXT("pending_shutdown_regression")) bPending = true;
+				if (Name == TEXT("immutable_regression"))
+					bImmutable = Event->GetObjectField(TEXT("nested"))->GetStringField(TEXT("value")) == TEXT("before");
+			}
+		}
+		Check(bSizeValid, TEXT("regression: persisted batches respect UTF-8 byte and event limits"));
+		Check(UnicodeCount == 90 && bPending, TEXT("regression: shutdown retains in-flight and pending events"));
+		Check(bImmutable, TEXT("regression: nested mutation after Track cannot alter queued events"));
+	}
+	Req(TEXT("POST"), TEXT("/__harness/mode"), TEXT("{\"events\":\"ok\"}"));
+
 	// ---- Phase B: remote — the kill switch, both directions.
 	{
 		FPhase Phase(TEXT("\"remote\""));

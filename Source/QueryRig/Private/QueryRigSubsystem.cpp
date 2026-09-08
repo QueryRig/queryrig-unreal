@@ -13,6 +13,7 @@
 #include "Misc/Guid.h"
 #include "Misc/Parse.h"
 #include "Misc/Paths.h"
+#include "Misc/SecureHash.h"
 #include "Policies/CondensedJsonPrintPolicy.h"
 #include "Serialization/JsonReader.h"
 #include "Serialization/JsonSerializer.h"
@@ -33,6 +34,25 @@ namespace
 	constexpr int64 BackoffCapMs = 5 * 60 * 1000;
 	constexpr int64 RejectedFileMaxBytes = 262144;
 	constexpr float HttpTimeoutS = 5.0f;
+
+	bool ValidJson(const TSharedPtr<FJsonValue>& Value, int32 Depth)
+	{
+		if (!Value.IsValid()) return false;
+		if (Depth >= 8 && (Value->Type == EJson::Array || Value->Type == EJson::Object)) return false;
+		if (Value->Type == EJson::Number) return FMath::IsFinite(Value->AsNumber());
+		if (Value->Type == EJson::Array)
+		{
+			for (const auto& Item : Value->AsArray()) if (!ValidJson(Item, Depth + 1)) return false;
+		}
+		if (Value->Type == EJson::Object)
+		{
+			if (!Value->AsObject().IsValid()) return false;
+			for (const auto& Pair : Value->AsObject()->Values) if (!ValidJson(Pair.Value, Depth + 1)) return false;
+		}
+		return true;
+	}
+
+	int32 WireBytes(const FString& Line) { return FTCHARToUTF8(*Line).Length(); }
 }
 
 // ---------------------------------------------------------------- lifecycle
@@ -41,6 +61,12 @@ void UQueryRigSubsystem::Initialize(FSubsystemCollectionBase& Collection)
 {
 	Super::Initialize(Collection);
 	LoadConfig();
+	FString Endpoint = Config.Endpoint;
+	Endpoint.RemoveFromEnd(TEXT("/"));
+	const FTCHARToUTF8 Identity(*(Endpoint + TEXT("\n") + Config.ApiKey));
+	uint8 Digest[20];
+	FSHA1::HashBuffer(Identity.Get(), Identity.Length(), Digest);
+	QueueNamespace = BytesToHex(Digest, 20).ToLower();
 
 	if (Config.Mode == EEnabledMode::HardOff || Config.ApiKey.IsEmpty())
 	{
@@ -63,7 +89,8 @@ void UQueryRigSubsystem::Initialize(FSubsystemCollectionBase& Collection)
 		FTickerDelegate::CreateUObject(this, &UQueryRigSubsystem::OnFlushTick),
 		FMath::Max(0.1, Config.FlushIntervalS));
 
-	if (Config.Mode == EEnabledMode::Remote)
+	// Even hard-on must recover after a temporary 401. Hard-off remains inert.
+	if (!bInert)
 	{
 		TWeakObjectPtr<UQueryRigSubsystem> WeakThis(this);
 		GateTickerHandle = FTSTicker::GetCoreTicker().AddTicker(
@@ -92,6 +119,7 @@ void UQueryRigSubsystem::Deinitialize()
 {
 	if (!bInert)
 	{
+		bShuttingDown = true;
 		FTSTicker::GetCoreTicker().RemoveTicker(FlushTickerHandle);
 		FTSTicker::GetCoreTicker().RemoveTicker(GateTickerHandle);
 		FCoreDelegates::ApplicationWillEnterBackgroundDelegate.Remove(BackgroundHandle);
@@ -99,29 +127,16 @@ void UQueryRigSubsystem::Deinitialize()
 
 		EndSession();
 
-		// Shutdown persistence: HTTP can't be awaited during teardown, so the
-		// whole remaining queue goes to disk and replays next launch with its
-		// original event_ids and timestamps (deduped server-side).
-		TArray<TSharedPtr<FJsonObject>> Remaining;
+		// Every outstanding HTTP batch already has an atomic queue file.
+		if (ActiveRequest.IsValid())
 		{
-			FScopeLock Lock(&QueueLock);
-			Remaining = MoveTemp(Queue);
-			Queue.Reset();
+			ActiveRequest->OnProcessRequestComplete().Unbind();
+			ActiveRequest->CancelRequest();
+			ActiveRequest.Reset();
 		}
-		TArray<FString> Lines;
-		for (const TSharedPtr<FJsonObject>& Event : Remaining)
-		{
-			Lines.Add(SerializeEvent(Event));
-			if (Lines.Num() >= MaxBatchEvents)
-			{
-				SpillToDisk(Lines);
-				Lines.Reset();
-			}
-		}
-		if (Lines.Num() > 0)
-		{
-			SpillToDisk(Lines);
-		}
+		bRequestInFlight = false;
+		PersistQueue();
+		if (Queue.Num()) UE_LOG(LogQueryRig, Error, TEXT("Shutdown persistence failed; events remain memory-only"));
 	}
 	Super::Deinitialize();
 }
@@ -130,6 +145,7 @@ void UQueryRigSubsystem::Deinitialize()
 
 void UQueryRigSubsystem::Track(const FString& EventName, TSharedPtr<FJsonObject> Properties)
 {
+	if (!ensureMsgf(IsInGameThread(), TEXT("QueryRig tracking requires the game thread"))) return;
 	const TSharedPtr<FJsonObject> Fields = MakeShared<FJsonObject>();
 	if (Properties.IsValid())
 	{
@@ -144,7 +160,8 @@ void UQueryRigSubsystem::Track(const FString& EventName, TSharedPtr<FJsonObject>
 
 void UQueryRigSubsystem::TrackFields(TSharedPtr<FJsonObject> Fields)
 {
-	if (bInert || !IsCollecting() || !bSampledIn)
+	if (!ensureMsgf(IsInGameThread(), TEXT("QueryRig tracking requires the game thread"))) return;
+	if (bInert || bShuttingDown || !IsCollecting())
 	{
 		return;
 	}
@@ -154,7 +171,7 @@ void UQueryRigSubsystem::TrackFields(TSharedPtr<FJsonObject> Fields)
 		StartSession(); // 30-minute idle rollover (spec §3.5)
 	}
 	LastEventMs = Now;
-	Enqueue(Stamp(Fields));
+	if (bSampledIn) Enqueue(Stamp(Fields));
 }
 
 void UQueryRigSubsystem::TrackEvent(const FString& EventName, const TMap<FString, FString>& Properties)
@@ -188,6 +205,7 @@ TSharedPtr<FJsonObject> UQueryRigSubsystem::MapToJson(const TMap<FString, FStrin
 
 void UQueryRigSubsystem::SetPlayerId(const FString& InPlayerId)
 {
+	if (!ensureMsgf(IsInGameThread(), TEXT("QueryRig identity changes require the game thread"))) return;
 	PlayerId = InPlayerId;
 }
 
@@ -214,7 +232,8 @@ void UQueryRigSubsystem::Flush()
 
 void UQueryRigSubsystem::RefreshGate()
 {
-	if (!bInert && Config.Mode == EEnabledMode::Remote)
+	if (!ensureMsgf(IsInGameThread(), TEXT("QueryRig gate refresh requires the game thread"))) return;
+	if (!bInert && !bShuttingDown)
 	{
 		CheckGate();
 	}
@@ -399,10 +418,21 @@ TSharedPtr<FJsonObject> UQueryRigSubsystem::Stamp(const TSharedPtr<FJsonObject>&
 
 void UQueryRigSubsystem::Enqueue(const TSharedPtr<FJsonObject>& Event)
 {
+	if (!ValidJson(MakeShared<FJsonValueObject>(Event), 0))
+	{
+		UE_LOG(LogQueryRig, Warning, TEXT("Invalid event discarded (type, depth, cycle or non-finite number)"));
+		return;
+	}
+	const FString Line = SerializeEvent(Event); // immutable before Track returns
+	if (Line.IsEmpty() || WireBytes(Line) + 2 > FlushMaxBytes)
+	{
+		UE_LOG(LogQueryRig, Warning, TEXT("Oversized/unserializable event discarded"));
+		return;
+	}
 	bool bRequestFlush = false;
 	{
 		FScopeLock Lock(&QueueLock);
-		Queue.Add(Event);
+		Queue.Add(Line);
 		while (Queue.Num() > MemoryQueueMax) // drop OLDEST on overflow
 		{
 			Queue.RemoveAt(0);
@@ -448,76 +478,9 @@ bool UQueryRigSubsystem::OnFlushTick(float /*DeltaTime*/)
 
 void UQueryRigSubsystem::SendNextLiveBatch()
 {
-	if (bDormant || bRequestInFlight)
-	{
-		return;
-	}
-
-	// Pull up to a spec-sized batch; put byte-cap overflow back at the front.
-	TArray<TSharedPtr<FJsonObject>> Events;
-	int32 Dropped = 0;
-	{
-		FScopeLock Lock(&QueueLock);
-		const int32 Take = FMath::Min(Queue.Num(), MaxBatchEvents);
-		if (Take == 0)
-		{
-			DrainDiskOne();
-			return;
-		}
-		Events.Append(Queue.GetData(), Take);
-		Queue.RemoveAt(0, Take);
-		Dropped = DroppedOverflow;
-		DroppedOverflow = 0;
-	}
-	if (Dropped > 0)
-	{
-		UE_LOG(LogQueryRig, Warning, TEXT("Memory queue overflowed; dropped %d oldest events"), Dropped);
-	}
-
-	TArray<FString> Lines;
-	int32 Bytes = 0;
-	int32 Used = 0;
-	for (const TSharedPtr<FJsonObject>& Event : Events)
-	{
-		const FString Line = SerializeEvent(Event);
-		if (Lines.Num() > 0 && Bytes + Line.Len() > FlushMaxBytes)
-		{
-			break;
-		}
-		Bytes += Line.Len();
-		Lines.Add(Line);
-		Used++;
-	}
-	if (Used < Events.Num())
-	{
-		FScopeLock Lock(&QueueLock);
-		for (int32 i = Events.Num() - 1; i >= Used; --i)
-		{
-			Queue.Insert(Events[i], 0);
-		}
-	}
-
-	TWeakObjectPtr<UQueryRigSubsystem> WeakThis(this);
-	SendBatch(Lines, [WeakThis, Lines](ESendOutcome Outcome)
-	{
-		if (!WeakThis.IsValid())
-		{
-			return;
-		}
-		UQueryRigSubsystem* Self = WeakThis.Get();
-		switch (Outcome)
-		{
-		case ESendOutcome::Delivered:
-			Self->SendNextLiveBatch(); // continue the queue, or drain disk
-			break;
-		case ESendOutcome::Rejected:
-			Self->AppendRejected(Lines);
-			break;
-		default: // Retryable or Dormant: spill; the drain loop owns retries
-			Self->SpillToDisk(Lines);
-			break;
-		}
-	});
+	if (bShuttingDown) return;
+	PersistQueue();
+	DrainDiskOne();
 }
 
 // One batch -> one POST. Pure delivery attempt — the CALLER decides what to
@@ -525,6 +488,7 @@ void UQueryRigSubsystem::SendNextLiveBatch()
 // duplicate file.
 void UQueryRigSubsystem::SendBatch(TArray<FString> Lines, TFunction<void(ESendOutcome)> OnSettled)
 {
+	if (bShuttingDown || bDormant || NowMs() < NextDrainMs) { OnSettled(ESendOutcome::Retryable); return; }
 	const FString Body = TEXT("[") + FString::Join(Lines, TEXT(",")) + TEXT("]");
 	const TSharedRef<IHttpRequest, ESPMode::ThreadSafe> Request = FHttpModule::Get().CreateRequest();
 	Request->SetURL(Config.Endpoint);
@@ -536,31 +500,34 @@ void UQueryRigSubsystem::SendBatch(TArray<FString> Lines, TFunction<void(ESendOu
 	Request->SetContentAsString(Body);
 
 	bRequestInFlight = true;
+	ActiveRequest = Request;
 	TWeakObjectPtr<UQueryRigSubsystem> WeakThis(this);
 	Request->OnProcessRequestComplete().BindLambda(
-		[WeakThis, OnSettled](FHttpRequestPtr, FHttpResponsePtr Response, bool bConnected)
+		[WeakThis, OnSettled, Count = Lines.Num()](FHttpRequestPtr Completed, FHttpResponsePtr Response, bool bConnected)
 		{
 			if (!WeakThis.IsValid())
 			{
 				return;
 			}
 			UQueryRigSubsystem* Self = WeakThis.Get();
+			if (Self->bShuttingDown || Self->ActiveRequest != Completed) return;
+			Self->ActiveRequest.Reset();
 			Self->bRequestInFlight = false;
 			const int32 Code = (bConnected && Response.IsValid()) ? Response->GetResponseCode() : 0;
 
 			if (Code == 200)
 			{
-				Self->NoteSuccess();
 				TSharedPtr<FJsonObject> Parsed;
 				const TSharedRef<TJsonReader<TCHAR>> Reader = TJsonReaderFactory<TCHAR>::Create(Response->GetContentAsString());
-				if (FJsonSerializer::Deserialize(Reader, Parsed) && Parsed.IsValid())
+				int32 Accepted = -1, Rejected = -1;
+				if (!FJsonSerializer::Deserialize(Reader, Parsed) || !Parsed.IsValid()
+					|| !Parsed->TryGetNumberField(TEXT("accepted"), Accepted) || !Parsed->TryGetNumberField(TEXT("rejected"), Rejected)
+					|| Accepted < 0 || Rejected < 0 || Accepted + Rejected != Count)
 				{
-					int32 Rejected = 0;
-					if (Parsed->TryGetNumberField(TEXT("rejected"), Rejected) && Rejected > 0)
-					{
-						UE_LOG(LogQueryRig, Warning, TEXT("Server rejected %d event(s) — integration bug, see response results"), Rejected);
-					}
+					Self->NoteFailure(); OnSettled(ESendOutcome::Retryable); return;
 				}
+				Self->NoteSuccess();
+				if (Rejected > 0) UE_LOG(LogQueryRig, Warning, TEXT("Server rejected %d events"), Rejected);
 				OnSettled(ESendOutcome::Delivered);
 			}
 			else if (Code == 401)
@@ -582,7 +549,12 @@ void UQueryRigSubsystem::SendBatch(TArray<FString> Lines, TFunction<void(ESendOu
 				OnSettled(ESendOutcome::Retryable);
 			}
 		});
-	Request->ProcessRequest();
+	if (!Request->ProcessRequest() && ActiveRequest == Request)
+	{
+		Request->OnProcessRequestComplete().Unbind();
+		ActiveRequest.Reset(); bRequestInFlight = false; NoteFailure();
+		OnSettled(ESendOutcome::Retryable);
+	}
 }
 
 void UQueryRigSubsystem::NoteSuccess()
@@ -603,7 +575,7 @@ void UQueryRigSubsystem::NoteFailure()
 
 FString UQueryRigSubsystem::DataDir() const
 {
-	return FPaths::ProjectSavedDir() / TEXT("QueryRig");
+	return FPaths::ProjectSavedDir() / TEXT("QueryRig") / QueueNamespace;
 }
 
 FString UQueryRigSubsystem::QueueDir() const
@@ -611,16 +583,41 @@ FString UQueryRigSubsystem::QueueDir() const
 	return DataDir() / TEXT("queue");
 }
 
-void UQueryRigSubsystem::SpillToDisk(const TArray<FString>& Lines)
+bool UQueryRigSubsystem::SpillToDisk(const TArray<FString>& Lines)
 {
-	const FString Path = FString::Printf(TEXT("%s/%lld_%06d.ndjson"), *QueueDir(), NowMs(), FMath::Rand() % 1000000);
-	if (!FFileHelper::SaveStringToFile(FString::Join(Lines, TEXT("\n")), *Path,
+	const FString Path = FString::Printf(TEXT("%s/%lld_%s.ndjson"), *QueueDir(), NowMs(), *NewUuid());
+	if (!FFileHelper::SaveStringToFile(FString::Join(Lines, TEXT("\n")), *(Path + TEXT(".tmp")),
 		FFileHelper::EEncodingOptions::ForceUTF8WithoutBOM))
 	{
-		UE_LOG(LogQueryRig, Warning, TEXT("Cannot write disk queue; %d events lost"), Lines.Num());
-		return;
+		UE_LOG(LogQueryRig, Warning, TEXT("Cannot persist %d events; retaining in memory"), Lines.Num());
+		return false;
 	}
+	if (!IFileManager::Get().Move(*Path, *(Path + TEXT(".tmp")), false, false)) return false;
 	EnforceDiskCap();
+	return true;
+}
+
+void UQueryRigSubsystem::PersistQueue()
+{
+	TArray<FString> Pending;
+	{ FScopeLock Lock(&QueueLock); Pending = MoveTemp(Queue); Queue.Reset(); }
+	TArray<FString> Batch;
+	int32 Bytes = 2;
+	auto Save = [this, &Batch, &Bytes]()
+	{
+		if (Batch.Num() && !SpillToDisk(Batch))
+		{ FScopeLock Lock(&QueueLock); Queue.Append(Batch); }
+		Batch.Reset(); Bytes = 2;
+	};
+	for (const FString& Line : Pending)
+	{
+		const int32 Size = WireBytes(Line) + 1;
+		if (Batch.Num() >= MaxBatchEvents || (Batch.Num() && Bytes + Size > FlushMaxBytes)) Save();
+		Batch.Add(Line); Bytes += Size;
+	}
+	Save();
+	if (DroppedOverflow) UE_LOG(LogQueryRig, Warning, TEXT("Memory cap dropped %d oldest events"), DroppedOverflow);
+	DroppedOverflow = 0;
 }
 
 void UQueryRigSubsystem::EnforceDiskCap()
@@ -639,6 +636,7 @@ void UQueryRigSubsystem::EnforceDiskCap()
 	for (int32 i = 0; Total > Config.DiskQueueMaxBytes && i < Files.Num(); ++i) // drop OLDEST first
 	{
 		IFileManager::Get().Delete(*(QueueDir() / Files[i]));
+		UE_LOG(LogQueryRig, Warning, TEXT("Disk cap evicted an oldest batch"));
 		Total -= Sizes[i];
 	}
 }
@@ -647,7 +645,7 @@ void UQueryRigSubsystem::EnforceDiskCap()
 // the failure backoff. Original event_ids/timestamps ride along unchanged.
 void UQueryRigSubsystem::DrainDiskOne()
 {
-	if (bDormant || bRequestInFlight || NowMs() < NextDrainMs)
+	if (bShuttingDown || bDormant || bRequestInFlight || NowMs() < NextDrainMs)
 	{
 		return;
 	}
@@ -661,8 +659,8 @@ void UQueryRigSubsystem::DrainDiskOne()
 	const FString Path = QueueDir() / Files[0];
 
 	TArray<FString> Lines;
-	FFileHelper::LoadFileToStringArrayWithPredicate(Lines, *Path,
-		[](const FString& Line) { return !Line.TrimStartAndEnd().IsEmpty(); });
+	if (!FFileHelper::LoadFileToStringArrayWithPredicate(Lines, *Path,
+		[](const FString& Line) { return !Line.TrimStartAndEnd().IsEmpty(); })) return;
 	if (Lines.Num() == 0)
 	{
 		IFileManager::Get().Delete(*Path);
@@ -709,6 +707,7 @@ void UQueryRigSubsystem::AppendRejected(const TArray<FString>& Lines)
 
 void UQueryRigSubsystem::CheckGate()
 {
+	if (bShuttingDown) return;
 	const TSharedRef<IHttpRequest, ESPMode::ThreadSafe> Request = FHttpModule::Get().CreateRequest();
 	Request->SetURL(EndpointOrigin() + TEXT("/v1/config"));
 	Request->SetVerb(TEXT("GET"));
@@ -725,6 +724,7 @@ void UQueryRigSubsystem::CheckGate()
 				return;
 			}
 			UQueryRigSubsystem* Self = WeakThis.Get();
+			if (Self->bShuttingDown) return;
 			const int32 Code = (bConnected && Response.IsValid()) ? Response->GetResponseCode() : 0;
 
 			bool bEnabled = false;
