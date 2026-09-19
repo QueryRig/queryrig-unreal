@@ -118,6 +118,13 @@ funnels stay coherent).
 
 ## Delivery limits and upgrading
 
+Event uploads allow 30 seconds for a complete acknowledgement, leaving room
+for the server's 15-second ClickHouse timeout and R2 fallback. Config checks
+still time out after 5 seconds. A successful R2 acknowledgement completes the
+batch; a timeout retains it for backoff/retry with the same IDs and timestamps.
+Shutdown cancels outstanding uploads instead of waiting for the deadline.
+This does not guarantee a response within 30 seconds on every network.
+
 Call the SDK on Unreal's game thread. Tracking serializes JSON immediately,
 so changing nested properties after the call cannot alter queued events.
 Cycles, non-finite numbers, excessive depth, and events exceeding 200 KB in

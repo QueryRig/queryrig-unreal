@@ -33,7 +33,9 @@ namespace
 	constexpr int64 BackoffBaseMs = 5000;
 	constexpr int64 BackoffCapMs = 5 * 60 * 1000;
 	constexpr int64 RejectedFileMaxBytes = 262144;
-	constexpr float HttpTimeoutS = 5.0f;
+	// Outlast the Worker's 15s ClickHouse timeout plus R2 fallback.
+	constexpr float EventHttpTimeoutS = 30.0f;
+	constexpr float ConfigHttpTimeoutS = 5.0f;
 
 	bool ValidJson(const TSharedPtr<FJsonValue>& Value, int32 Depth)
 	{
@@ -496,7 +498,7 @@ void UQueryRigSubsystem::SendBatch(TArray<FString> Lines, TFunction<void(ESendOu
 	Request->SetHeader(TEXT("Content-Type"), TEXT("application/json"));
 	Request->SetHeader(TEXT("Authorization"), FString::Printf(TEXT("Bearer %s"), *Config.ApiKey));
 	Request->SetHeader(TEXT("User-Agent"), FString::Printf(TEXT("queryrig-unreal/%s"), SdkVersion));
-	Request->SetTimeout(HttpTimeoutS);
+	Request->SetTimeout(EventHttpTimeoutS);
 	Request->SetContentAsString(Body);
 
 	bRequestInFlight = true;
@@ -713,7 +715,7 @@ void UQueryRigSubsystem::CheckGate()
 	Request->SetVerb(TEXT("GET"));
 	Request->SetHeader(TEXT("Authorization"), FString::Printf(TEXT("Bearer %s"), *Config.ApiKey));
 	Request->SetHeader(TEXT("User-Agent"), FString::Printf(TEXT("queryrig-unreal/%s"), SdkVersion));
-	Request->SetTimeout(HttpTimeoutS);
+	Request->SetTimeout(ConfigHttpTimeoutS);
 
 	TWeakObjectPtr<UQueryRigSubsystem> WeakThis(this);
 	Request->OnProcessRequestComplete().BindLambda(

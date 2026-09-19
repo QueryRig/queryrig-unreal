@@ -289,6 +289,21 @@ int32 UQueryRigConformanceCommandlet::Main(const FString& Params)
 		}
 		Check(bUserAgent, TEXT("wire: User-Agent identifies the SDK"));
 
+		// Acknowledgement after the 15s CH deadline must not trigger a retry.
+		Pump(0.2);
+		const int32 SlowBefore = HarnessRows();
+		const int32 SlowRequestsBefore = EventsRequestCount();
+		Req(TEXT("POST"), TEXT("/__harness/mode"), TEXT("{\"events\":\"slow-fallback\"}"));
+		Phase.Rig->Track(TEXT("slow_fallback"), nullptr);
+		Phase.Rig->Flush();
+		Check(WaitUntil([SlowBefore] { return HarnessRows() >= SlowBefore + 1; }, 22.0),
+			TEXT("fallback: a 16-second R2 acknowledgement arrives"));
+		Pump(0.3);
+		Phase.Rig->Flush();
+		Pump(0.5);
+		Check(EventsRequestCount() == SlowRequestsBefore + 1, TEXT("fallback: exactly one POST, no premature retry"));
+		Req(TEXT("POST"), TEXT("/__harness/mode"), TEXT("{\"events\":\"ok\"}"));
+
 		// ---- Outage: break the backend, verify spill + zero-loss drain.
 		const int32 Before = HarnessRows();
 		Req(TEXT("POST"), TEXT("/__harness/mode"), TEXT("{\"events\":\"unavailable\"}"));
