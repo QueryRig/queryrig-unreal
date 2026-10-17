@@ -77,6 +77,19 @@ public:
 	UFUNCTION(BlueprintPure, Category = "QueryRig")
 	bool IsEnabled() const;
 
+	/**
+	 * Why Url cannot be an ingest endpoint, or empty if it can: HTTPS to any
+	 * host, or plain HTTP to a loopback address for local development.
+	 */
+	static FString EndpointProblem(const FString& Url);
+
+	/**
+	 * The default player id: a hash of the raw device id scoped to the
+	 * endpoint's host, so the raw id never leaves the device and different
+	 * games on one machine get unrelated ids.
+	 */
+	static FString PseudonymousPlayerId(const FString& RawDeviceId, const FString& Endpoint);
+
 private:
 	enum class EEnabledMode : uint8 { HardOff, HardOn, Remote };
 	enum class ESendOutcome : uint8 { Delivered, Rejected, Retryable, Dormant };
@@ -96,6 +109,9 @@ private:
 	FRigConfig Config;
 	bool bInert = true;   // hard-off or no api_key: Track() no-ops, zero network
 	bool bDormant = false; // 401 or gate-off: drop new events, keep disk queue
+	// 403 from the edge (plain HTTP, wrong path): a misconfigured endpoint no
+	// retry can fix. Delivery stops until restart; queued batches are kept.
+	bool bEdgeBlocked = false;
 	bool bSampledIn = true;
 	bool bRequestInFlight = false;
 	bool bShuttingDown = false;

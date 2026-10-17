@@ -57,6 +57,12 @@ Rig->Track(TEXT("level_complete"), Props);
 `session_start` / `session_end` events are emitted for you, with a 30-minute
 idle rollover.
 
+The default player id is pseudonymous: a hash of the device id scoped to your
+project's endpoint, so the raw hardware id never leaves the device and the
+same machine has unrelated ids in different games. If you pass your own id,
+prefer an opaque account id over a name or email address, and if your game is
+played by children, send only pseudonymous ids (see the QueryRig terms).
+
 ### Your fields, your names
 
 Nothing is reserved. Apart from `timestamp` and `event_id`, every field you
@@ -88,10 +94,18 @@ key and endpoint come from the Keys tab of your QueryRig project:
 ```json
 {
   "api_key": "qr_ingest_...",
-  "endpoint": "https://ingest.example.com/v1/events",
+  "endpoint": "https://3fa91c0e.qrig.net/v1/events",
   "enabled": "remote"
 }
 ```
+
+Every project has its own endpoint, `https://<ingest id>.qrig.net/v1/events`,
+and it accepts only that project's key, so always copy the two together. The
+endpoint must use `https://` (plain `http://` is allowed only for loopback
+addresses, for local development). With a key but no usable endpoint, the SDK
+logs one warning at startup and stays off for that run. (Warnings, not
+errors: an `Error` log fails any commandlet or automation run that boots a game
+instance.)
 
 Resolution order: built-in defaults < `<Project>/Config/queryrig.json` <
 `queryrig.json` **next to the executable** < `Saved/Config/queryrig.json` <
@@ -146,6 +160,25 @@ are left intact but are **not automatically replayed**; recover them only after
 verifying the destination project. The backend must preserve historical
 timestamps for retry-safe deduplication beyond seven days.
 
+How the SDK reacts when it cannot deliver:
+
+| What happens | SDK behavior |
+|---|---|
+| 401 (key unknown, disabled, or used on another project's endpoint) | Dormant: keeps queued events, re-checks the remote gate on its poll interval. |
+| 403 from the edge (plain HTTP, or a path outside the ingest API) | Logs one warning naming the endpoint and stops delivery until the game restarts. Queued events are kept. |
+| Endpoint host does not resolve (the project is deleted, or paused while clients kept sending) | Treated as a network error: keeps events on disk and backs off (5 s doubling to 5 min). |
+
+### Upgrading to 0.2.0
+
+- `endpoint` is now required with `api_key` and must use `https://` off
+  loopback. A config that relied on the old shared ingest host must switch to
+  the project's own endpoint from the Keys tab.
+- The default `player_id` is now a hash (see Use), so players tracked by
+  0.1.0 with the default id get a new id after the upgrade. Ids you set with
+  **Set Player Id** are unchanged.
+- Platforms without a login id keep their random fallback id across key
+  rotations: it now lives at `Saved/QueryRig/device_id`.
+
 ## Local development
 
 Run the SDK conformance harness from the queryrig repo (`npm run
@@ -165,8 +198,11 @@ The runner clears that host's local QueryRig queue and rewrites
 UnrealEditor-Cmd.exe <Host.uproject> -run=QueryRigConformance -unattended -nullrhi -nosplash -stdout
 ```
 
-Covers delivery + stamping, an outage (zero loss, zero duplicates after
-disk-queue replay), the remote kill switch both directions, and hard-off
+Covers delivery + stamping (including the hashed player id), an outage (zero
+loss, zero duplicates after disk-queue replay), an edge 403 treated as
+permanent without losing the batch, an unresolvable host backed off as a
+network error (live and at cold start), inert startup with a missing or
+non-HTTPS endpoint, the remote kill switch both directions, and hard-off
 silence. Exit code 0 on pass, 2 if the harness is unreachable.
 
 Also checks immutable nested properties, UTF-8 batch limits, and persistence

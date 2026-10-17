@@ -145,14 +145,30 @@ namespace
 		}
 	}
 
-	// The SDK's strongest config source below env/cmdline is Saved/Config —
-	// each phase rewrites it before booting a fresh GameInstance.
-	void WriteSdkConfig(const FString& EnabledLiteral)
+	int32 UnreachableAttempts()
 	{
+		const TSharedPtr<FJsonObject> State = ReqObject(TEXT("/__harness/state"));
+		return State.IsValid() ? static_cast<int32>(State->GetNumberField(TEXT("unreachableAttempts"))) : -1;
+	}
+
+	/** Queued batch files across every endpoint/key namespace. */
+	int32 QueueFileCount()
+	{
+		TArray<FString> Files;
+		IFileManager::Get().FindFilesRecursive(Files, *(FPaths::ProjectSavedDir() / TEXT("QueryRig")), TEXT("*.ndjson"), true, false);
+		return Files.FilterByPredicate([](const FString& File) { return File.Contains(TEXT("/queue/")); }).Num();
+	}
+
+	// The SDK's strongest config source below env/cmdline is Saved/Config —
+	// each phase rewrites it before booting a fresh GameInstance. An empty
+	// Endpoint means the harness.
+	void WriteSdkConfig(const FString& EnabledLiteral, const FString* Endpoint = nullptr)
+	{
+		const FString Url = Endpoint ? *Endpoint : GHarness + TEXT("/v1/events");
 		const FString Json = FString::Printf(
-			TEXT("{\"api_key\":\"test-key\",\"endpoint\":\"%s/v1/events\",\"enabled\":%s,")
+			TEXT("{\"api_key\":\"test-key\",\"endpoint\":\"%s\",\"enabled\":%s,")
 			TEXT("\"flush_interval_s\":999,\"gate_poll_interval_s\":999}"),
-			*GHarness, *EnabledLiteral);
+			*Url, *EnabledLiteral);
 		FFileHelper::SaveStringToFile(Json, *(FPaths::ProjectSavedDir() / TEXT("Config/queryrig.json")));
 	}
 
@@ -161,9 +177,9 @@ namespace
 		UGameInstance* GameInstance = nullptr;
 		UQueryRigSubsystem* Rig = nullptr;
 
-		explicit FPhase(const FString& EnabledLiteral)
+		explicit FPhase(const FString& EnabledLiteral, const FString* Endpoint = nullptr)
 		{
-			WriteSdkConfig(EnabledLiteral);
+			WriteSdkConfig(EnabledLiteral, Endpoint);
 			GameInstance = NewObject<UGameInstance>(GEngine);
 			GameInstance->AddToRoot();
 			GameInstance->InitializeStandalone();
@@ -264,6 +280,18 @@ int32 UQueryRigConformanceCommandlet::Main(const FString& Params)
 		Check(Names.Contains(TEXT("session_start")) && Names.Contains(TEXT("level_complete")),
 			TEXT("delivery: session_start + tracked events present"));
 		Check(bStamped, TEXT("stamping: player_id + platform set on every row"));
+		const FString ExpectedPlayer = UQueryRigSubsystem::PseudonymousPlayerId(FPlatformMisc::GetLoginId(), GHarness + TEXT("/v1/events"));
+		bool bHashedPlayer = !FPlatformMisc::GetLoginId().IsEmpty();
+		for (const TSharedPtr<FJsonValue>& Value : ReqArray(TEXT("/__harness/rows")))
+		{
+			const TSharedPtr<FJsonObject>* Row;
+			const TSharedPtr<FJsonObject>* Props;
+			if (Value->TryGetObject(Row) && (*Row)->TryGetObjectField(TEXT("properties"), Props))
+			{
+				bHashedPlayer &= (*Props)->GetStringField(TEXT("player_id")) == ExpectedPlayer;
+			}
+		}
+		Check(bHashedPlayer && ExpectedPlayer.Len() == 32, TEXT("stamping: default player_id is a hash, not the raw device id"));
 		Check(Sessions.Num() == 1, TEXT("stamping: one session_id across the batch"));
 		Check(Ids.Num() == 5, TEXT("stamping: event_ids unique"));
 		Check(UnnamedProps.IsValid()
@@ -373,6 +401,68 @@ int32 UQueryRigConformanceCommandlet::Main(const FString& Params)
 	}
 	Req(TEXT("POST"), TEXT("/__harness/mode"), TEXT("{\"events\":\"ok\"}"));
 
+	// ---- Edge 403 (plain HTTP or a path outside the ingest API): stop
+	// sending, keep the batch, no retry until restart.
+	int32 EdgeRowsBefore = 0;
+	{
+		FPhase Phase(TEXT("true"));
+		Phase.Rig->Flush();
+		Pump(0.3);
+		EdgeRowsBefore = HarnessRows();
+		Req(TEXT("POST"), TEXT("/__harness/mode"), TEXT("{\"events\":\"edge-forbidden\"}"));
+		const int32 Before = EventsRequestCount();
+		Phase.Rig->Track(TEXT("edge_refused"), nullptr);
+		Phase.Rig->Flush();
+		Check(WaitUntil([Before] { return EventsRequestCount() == Before + 1; }, 5.0), TEXT("edge 403: the batch is attempted once"));
+		Check(WaitUntil([&Phase] { return !Phase.Rig->IsEnabled(); }, 5.0), TEXT("edge 403: the SDK reports itself off"));
+		Pump(6.0); // longer than the first retry backoff would be
+		Phase.Rig->Flush();
+		Pump(0.5);
+		Check(EventsRequestCount() == Before + 1, TEXT("edge 403: no retry, even after the backoff window"));
+		Check(QueueFileCount() > 0, TEXT("edge 403: the refused batch is kept on disk"));
+	}
+	Req(TEXT("POST"), TEXT("/__harness/mode"), TEXT("{\"events\":\"ok\"}"));
+	{
+		// A restart with the corrected endpoint (same here) delivers it.
+		FPhase Phase(TEXT("true"));
+		for (int32 i = 0; i < 4; ++i)
+		{
+			Phase.Rig->Flush();
+			Pump(0.3);
+		}
+		Check(WaitUntil([EdgeRowsBefore] { return HarnessRows() >= EdgeRowsBefore + 1; }, 10.0),
+			TEXT("edge 403: kept events arrive after a restart"));
+		const TSharedPtr<FJsonObject> State = ReqObject(TEXT("/__harness/state"));
+		Check(State.IsValid() && static_cast<int32>(State->GetNumberField(TEXT("duplicates"))) == 0,
+			TEXT("edge 403: no duplicates after the restart"));
+	}
+
+	// ---- Unresolvable host (a DNS-blocked hostname): back off, keep, recover.
+	{
+		FPhase Phase(TEXT("true"));
+		Phase.Rig->Flush();
+		Pump(0.3);
+		const int32 RowsBefore = HarnessRows();
+		const int32 AttemptsBefore = UnreachableAttempts();
+		Req(TEXT("POST"), TEXT("/__harness/mode"), TEXT("{\"events\":\"unresolvable\"}"));
+		Phase.Rig->Track(TEXT("while_unreachable"), nullptr);
+		Phase.Rig->Flush();
+		Check(WaitUntil([AttemptsBefore] { return UnreachableAttempts() > AttemptsBefore; }, 5.0),
+			TEXT("unreachable: the batch is attempted"));
+		Pump(0.3);
+		Phase.Rig->Flush();
+		Phase.Rig->Flush();
+		Pump(1.0);
+		Check(UnreachableAttempts() == AttemptsBefore + 1, TEXT("unreachable: backoff holds further attempts"));
+		Check(QueueFileCount() > 0 && Phase.Rig->IsEnabled(), TEXT("unreachable: batch kept, not treated as a permanent refusal"));
+
+		Req(TEXT("POST"), TEXT("/__harness/mode"), TEXT("{\"events\":\"ok\"}"));
+		Pump(7.0); // ride out the first retry backoff (~5s + jitter)
+		Phase.Rig->Flush();
+		Check(WaitUntil([RowsBefore] { return HarnessRows() >= RowsBefore + 1; }, 10.0),
+			TEXT("unreachable: recovers by itself and delivers"));
+	}
+
 	// ---- Phase B: remote — the kill switch, both directions.
 	{
 		FPhase Phase(TEXT("\"remote\""));
@@ -408,6 +498,41 @@ int32 UQueryRigConformanceCommandlet::Main(const FString& Params)
 		const TSharedPtr<FJsonObject> State = ReqObject(TEXT("/__harness/state"));
 		Check(State.IsValid() && static_cast<int32>(State->GetNumberField(TEXT("requests"))) == 0,
 			TEXT("hard-off: zero network calls of any kind"));
+	}
+
+	// ---- A key with no endpoint, or a non-HTTPS one off loopback, is inert:
+	// no requests, no retries (spec §2.2).
+	for (const TCHAR* Bad : { TEXT(""), TEXT("http://ingest.example.com/v1/events"), TEXT("ingest.example.com/v1/events") })
+	{
+		const FString Endpoint = Bad;
+		FPhase Phase(TEXT("true"), &Endpoint);
+		Req(TEXT("POST"), TEXT("/__harness/reset"), TEXT("{}"));
+		Phase.Rig->Track(TEXT("never_sent"), nullptr);
+		Phase.Rig->Flush();
+		Pump(0.5);
+		const TSharedPtr<FJsonObject> State = ReqObject(TEXT("/__harness/state"));
+		Check(!Phase.Rig->IsEnabled() && State.IsValid() && static_cast<int32>(State->GetNumberField(TEXT("requests"))) == 0,
+			*FString::Printf(TEXT("bad endpoint: inert with %s"), Endpoint.IsEmpty() ? TEXT("no endpoint") : *Endpoint));
+	}
+	Check(UQueryRigSubsystem::EndpointProblem(TEXT("https://3fa91c0e.qrig.net/v1/events")).IsEmpty()
+		&& UQueryRigSubsystem::EndpointProblem(GHarness + TEXT("/v1/events")).IsEmpty(),
+		TEXT("bad endpoint: HTTPS and loopback HTTP are accepted"));
+
+	// ---- Cold start on a DNS-blocked hostname: the gate fetch fails, the
+	// default answer holds, and events queue on disk instead of being lost.
+	{
+		FString Blocked = FPlatformMisc::GetEnvironmentVariable(TEXT("QUERYRIG_TEST_UNRESOLVABLE_ENDPOINT"));
+		if (Blocked.IsEmpty())
+		{
+			Blocked = TEXT("https://blocked.invalid/v1/events");
+		}
+		const int32 FilesBefore = QueueFileCount();
+		FPhase Phase(TEXT("\"remote\""), &Blocked);
+		Phase.Rig->Track(TEXT("cold_start_blocked"), nullptr);
+		Phase.Rig->Flush();
+		Check(WaitUntil([FilesBefore] { return QueueFileCount() > FilesBefore; }, 5.0), TEXT("blocked host: events queue on disk"));
+		Pump(1.0);
+		Check(Phase.Rig->IsEnabled(), TEXT("blocked host: still enabled, waiting to retry"));
 	}
 
 	if (GFailures == 0)

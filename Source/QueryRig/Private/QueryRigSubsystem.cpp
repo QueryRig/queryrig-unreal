@@ -23,7 +23,7 @@ DEFINE_LOG_CATEGORY_STATIC(LogQueryRig, Log, All);
 
 namespace
 {
-	const TCHAR* SdkVersion = TEXT("0.1.0");
+	const TCHAR* SdkVersion = TEXT("0.2.0");
 
 	// Spec limits (server-enforced; batches are built to stay inside them).
 	constexpr int32 MaxBatchEvents = 500;
@@ -55,6 +55,62 @@ namespace
 	}
 
 	int32 WireBytes(const FString& Line) { return FTCHARToUTF8(*Line).Length(); }
+
+	/** Lowercase host of an absolute URL, without port; "[::1]" keeps its brackets. */
+	FString UrlHost(const FString& Url)
+	{
+		const int32 SchemeEnd = Url.Find(TEXT("://"));
+		if (SchemeEnd == INDEX_NONE)
+		{
+			return FString();
+		}
+		FString Authority = Url.Mid(SchemeEnd + 3);
+		int32 Slash = INDEX_NONE;
+		if (Authority.FindChar(TEXT('/'), Slash))
+		{
+			Authority = Authority.Left(Slash);
+		}
+		if (Authority.StartsWith(TEXT("[")))
+		{
+			int32 Close = INDEX_NONE;
+			return Authority.FindChar(TEXT(']'), Close) ? Authority.Left(Close + 1).ToLower() : FString();
+		}
+		int32 Colon = INDEX_NONE;
+		if (Authority.FindLastChar(TEXT(':'), Colon))
+		{
+			Authority = Authority.Left(Colon);
+		}
+		return Authority.ToLower();
+	}
+}
+
+FString UQueryRigSubsystem::EndpointProblem(const FString& Url)
+{
+	const FString Trimmed = Url.TrimStartAndEnd();
+	if (Trimmed.IsEmpty())
+	{
+		return TEXT("no endpoint configured (copy it from the project's Keys tab)");
+	}
+	const bool bHttps = Trimmed.StartsWith(TEXT("https://"), ESearchCase::IgnoreCase);
+	const bool bHttp = Trimmed.StartsWith(TEXT("http://"), ESearchCase::IgnoreCase);
+	const FString Host = UrlHost(Trimmed);
+	if ((!bHttps && !bHttp) || Host.IsEmpty())
+	{
+		return FString::Printf(TEXT("endpoint %s is not a URL"), *Url);
+	}
+	if (bHttp && Host != TEXT("127.0.0.1") && Host != TEXT("localhost") && Host != TEXT("[::1]"))
+	{
+		return FString::Printf(TEXT("endpoint %s must use https://"), *Url);
+	}
+	return FString();
+}
+
+FString UQueryRigSubsystem::PseudonymousPlayerId(const FString& RawDeviceId, const FString& Endpoint)
+{
+	const FTCHARToUTF8 Input(*(TEXT("queryrig-player\n") + UrlHost(Endpoint) + TEXT("\n") + RawDeviceId));
+	uint8 Digest[20];
+	FSHA1::HashBuffer(Input.Get(), Input.Length(), Digest);
+	return BytesToHex(Digest, 20).ToLower().Left(32);
 }
 
 // ---------------------------------------------------------------- lifecycle
@@ -77,7 +133,20 @@ void UQueryRigSubsystem::Initialize(FSubsystemCollectionBase& Collection)
 		bInert = true;
 		return;
 	}
+	// A key needs its own project's endpoint, over HTTPS (spec §2.2). Without
+	// one the SDK is just as inert, so a bad config never spins on retries.
+	const FString Problem = EndpointProblem(Config.Endpoint);
+	if (!Problem.IsEmpty())
+	{
+		// Warning, not Error: an Error fails any commandlet or automation run
+		// that boots a game instance, and a telemetry config should never
+		// break a studio's build.
+		UE_LOG(LogQueryRig, Warning, TEXT("%s; telemetry is off for this run"), *Problem);
+		bInert = true;
+		return;
+	}
 	bInert = false;
+	bEdgeBlocked = false;
 
 	IFileManager::Get().MakeDirectory(*QueueDir(), true);
 	PlayerId = DefaultPlayerId();
@@ -243,7 +312,7 @@ void UQueryRigSubsystem::RefreshGate()
 
 bool UQueryRigSubsystem::IsEnabled() const
 {
-	return !bInert && !bDormant;
+	return !bInert && !bDormant && !bEdgeBlocked;
 }
 
 // ---------------------------------------------------------------- config
@@ -490,7 +559,7 @@ void UQueryRigSubsystem::SendNextLiveBatch()
 // duplicate file.
 void UQueryRigSubsystem::SendBatch(TArray<FString> Lines, TFunction<void(ESendOutcome)> OnSettled)
 {
-	if (bShuttingDown || bDormant || NowMs() < NextDrainMs) { OnSettled(ESendOutcome::Retryable); return; }
+	if (bShuttingDown || bDormant || bEdgeBlocked || NowMs() < NextDrainMs) { OnSettled(ESendOutcome::Retryable); return; }
 	const FString Body = TEXT("[") + FString::Join(Lines, TEXT(",")) + TEXT("]");
 	const TSharedRef<IHttpRequest, ESPMode::ThreadSafe> Request = FHttpModule::Get().CreateRequest();
 	Request->SetURL(Config.Endpoint);
@@ -539,6 +608,18 @@ void UQueryRigSubsystem::SendBatch(TArray<FString> Lines, TFunction<void(ESendOu
 				Self->bDormant = true;
 				OnSettled(ESendOutcome::Dormant);
 			}
+			else if (Code == 403)
+			{
+				// The edge refused the request before QueryRig saw it (spec §1):
+				// plain HTTP or a path outside the ingest API. Resending cannot
+				// succeed, and the events are valid, so keep them and stop.
+				if (!Self->bEdgeBlocked)
+				{
+					Self->bEdgeBlocked = true;
+					UE_LOG(LogQueryRig, Warning, TEXT("%s refused the upload at the edge (HTTP 403). Check the endpoint on the project's Keys tab; queued events are kept and delivery is stopped until restart."), *Self->Config.Endpoint);
+				}
+				OnSettled(ESendOutcome::Dormant);
+			}
 			else if (Code == 400 || Code == 413)
 			{
 				UE_LOG(LogQueryRig, Warning, TEXT("Batch rejected with HTTP %d — dropped (see Saved/QueryRig/rejected.ndjson)"), Code);
@@ -546,7 +627,8 @@ void UQueryRigSubsystem::SendBatch(TArray<FString> Lines, TFunction<void(ESendOu
 			}
 			else
 			{
-				// Network error, timeout, 5xx: retryable.
+				// Network error (an unresolvable, DNS-blocked host included),
+				// timeout, 5xx: retryable with backoff.
 				Self->NoteFailure();
 				OnSettled(ESendOutcome::Retryable);
 			}
@@ -647,7 +729,7 @@ void UQueryRigSubsystem::EnforceDiskCap()
 // the failure backoff. Original event_ids/timestamps ride along unchanged.
 void UQueryRigSubsystem::DrainDiskOne()
 {
-	if (bShuttingDown || bDormant || bRequestInFlight || NowMs() < NextDrainMs)
+	if (bShuttingDown || bDormant || bEdgeBlocked || bRequestInFlight || NowMs() < NextDrainMs)
 	{
 		return;
 	}
@@ -709,7 +791,7 @@ void UQueryRigSubsystem::AppendRejected(const TArray<FString>& Lines)
 
 void UQueryRigSubsystem::CheckGate()
 {
-	if (bShuttingDown) return;
+	if (bShuttingDown || bEdgeBlocked) return;
 	const TSharedRef<IHttpRequest, ESPMode::ThreadSafe> Request = FHttpModule::Get().CreateRequest();
 	Request->SetURL(EndpointOrigin() + TEXT("/v1/config"));
 	Request->SetVerb(TEXT("GET"));
@@ -742,8 +824,9 @@ void UQueryRigSubsystem::CheckGate()
 			}
 			else if (Code != 401)
 			{
-				// Fetch failure: keep the cached answer (spec §3.2) — losing
-				// data over a flaky config fetch is worse than sending.
+				// Fetch failure (offline, unresolvable host, 5xx, an edge 403):
+				// keep the cached answer (spec §3.2) — losing data over a flaky
+				// config fetch is worse than sending.
 				return;
 			}
 			Self->SaveCachedGate(bEnabled);
@@ -789,22 +872,24 @@ FString UQueryRigSubsystem::EndpointOrigin() const
 
 // ---------------------------------------------------------------- utils
 
+// The default player id is pseudonymous (see PseudonymousPlayerId). The host,
+// not the key, is the scope, so rotating the key keeps every player's id.
 FString UQueryRigSubsystem::DefaultPlayerId() const
 {
-	FString Id = FPlatformMisc::GetLoginId();
-	if (!Id.IsEmpty())
+	FString Raw = FPlatformMisc::GetLoginId();
+	if (Raw.IsEmpty())
 	{
-		return Id;
+		// Some platforms return "": persist a random device id instead, outside
+		// the endpoint/key namespace so a key rotation keeps it.
+		const FString Path = FPaths::ProjectSavedDir() / TEXT("QueryRig") / TEXT("device_id");
+		if (!FFileHelper::LoadFileToString(Raw, *Path) || Raw.TrimStartAndEnd().IsEmpty())
+		{
+			Raw = NewUuid();
+			FFileHelper::SaveStringToFile(Raw, *Path, FFileHelper::EEncodingOptions::ForceUTF8WithoutBOM);
+		}
+		Raw.TrimStartAndEndInline();
 	}
-	// Some platforms return "": persist a random device id instead.
-	const FString Path = DataDir() / TEXT("device_id");
-	if (FFileHelper::LoadFileToString(Id, *Path) && !Id.TrimStartAndEnd().IsEmpty())
-	{
-		return Id.TrimStartAndEnd();
-	}
-	Id = NewUuid();
-	FFileHelper::SaveStringToFile(Id, *Path, FFileHelper::EEncodingOptions::ForceUTF8WithoutBOM);
-	return Id;
+	return PseudonymousPlayerId(Raw, Config.Endpoint);
 }
 
 FString UQueryRigSubsystem::SerializeEvent(const TSharedPtr<FJsonObject>& Event)
