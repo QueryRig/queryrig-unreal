@@ -1,7 +1,7 @@
 {
 	"FileVersion": 3,
-	"Version": 2,
-	"VersionName": "0.2.0",
+	"Version": 3,
+	"VersionName": "0.2.1",
 	"FriendlyName": "QueryRig",
 	"Description": "QueryRig game analytics SDK — batched, durable event tracking with a runtime on/off switch.",
 	"Category": "Analytics",

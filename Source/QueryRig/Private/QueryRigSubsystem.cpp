@@ -23,7 +23,7 @@ DEFINE_LOG_CATEGORY_STATIC(LogQueryRig, Log, All);
 
 namespace
 {
-	const TCHAR* SdkVersion = TEXT("0.2.0");
+	const TCHAR* SdkVersion = TEXT("0.2.1");
 
 	// Spec limits (server-enforced; batches are built to stay inside them).
 	constexpr int32 MaxBatchEvents = 500;
