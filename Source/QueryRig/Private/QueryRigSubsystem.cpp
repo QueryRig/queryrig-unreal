@@ -147,6 +147,7 @@ void UQueryRigSubsystem::Initialize(FSubsystemCollectionBase& Collection)
 	}
 	bInert = false;
 	bEdgeBlocked = false;
+	bKeyRefused = false;
 
 	IFileManager::Get().MakeDirectory(*QueueDir(), true);
 	PlayerId = DefaultPlayerId();
@@ -606,6 +607,7 @@ void UQueryRigSubsystem::SendBatch(TArray<FString> Lines, TFunction<void(ESendOu
 				// Key unknown/disabled: go dormant, keep events on disk, let
 				// the gate poll decide when to wake up (spec §1 responses).
 				Self->bDormant = true;
+				Self->NoteKeyRefused(Self->Config.Endpoint);
 				OnSettled(ESendOutcome::Dormant);
 			}
 			else if (Code == 403)
@@ -645,6 +647,15 @@ void UQueryRigSubsystem::NoteSuccess()
 {
 	ConsecutiveFailures = 0;
 	NextDrainMs = 0;
+	bKeyRefused = false;
+}
+
+void UQueryRigSubsystem::NoteKeyRefused(const FString& Url)
+{
+	if (bKeyRefused) return;
+	bKeyRefused = true;
+	// Warning, not Error: an Error fails any commandlet or automation run.
+	UE_LOG(LogQueryRig, Warning, TEXT("%s refused the ingest key (HTTP 401). It may be disabled, rotated, or from another project; check the Keys tab. Events stay queued and sending resumes when the key is enabled."), *Url);
 }
 
 void UQueryRigSubsystem::NoteFailure()
@@ -822,7 +833,11 @@ void UQueryRigSubsystem::CheckGate()
 					return;
 				}
 			}
-			else if (Code != 401)
+			else if (Code == 401)
+			{
+				Self->NoteKeyRefused(Self->EndpointOrigin() + TEXT("/v1/config"));
+			}
+			else
 			{
 				// Fetch failure (offline, unresolvable host, 5xx, an edge 403):
 				// keep the cached answer (spec §3.2) — losing data over a flaky
@@ -830,6 +845,7 @@ void UQueryRigSubsystem::CheckGate()
 				return;
 			}
 			Self->SaveCachedGate(bEnabled);
+			if (bEnabled) Self->bKeyRefused = false;
 			Self->bDormant = !bEnabled;
 		});
 	Request->ProcessRequest();

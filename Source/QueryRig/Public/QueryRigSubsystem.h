@@ -109,6 +109,9 @@ private:
 	FRigConfig Config;
 	bool bInert = true;   // hard-off or no api_key: Track() no-ops, zero network
 	bool bDormant = false; // 401 or gate-off: drop new events, keep disk queue
+	// Set by the first 401 and cleared once the key is accepted again, so a
+	// refused key is reported once per dormant spell, not on every gate poll.
+	bool bKeyRefused = false;
 	// 403 from the edge (plain HTTP, wrong path): a misconfigured endpoint no
 	// retry can fix. Delivery stops until restart; queued batches are kept.
 	bool bEdgeBlocked = false;
@@ -158,6 +161,7 @@ private:
 	void SendBatch(TArray<FString> Lines, TFunction<void(ESendOutcome)> OnSettled);
 	void NoteSuccess();
 	void NoteFailure();
+	void NoteKeyRefused(const FString& Url);
 
 	// Disk queue
 	FString DataDir() const;
