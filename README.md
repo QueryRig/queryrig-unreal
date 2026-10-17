@@ -1,8 +1,7 @@
 # QueryRig SDK for Unreal Engine 5
 
-Game analytics for [QueryRig](https://github.com/prhym/queryrig): batched,
-durable event tracking with a runtime on/off switch. Implements the QueryRig
-engine SDK spec (`docs/sdk-spec.md` in the queryrig repo).
+Game analytics for [QueryRig](https://queryrig.com): batched, durable event
+tracking with a runtime on/off switch.
 
 - **Batched** — events queue in memory and flush every 5 s / 100 events, one
   HTTP request instead of dozens. `Track()` validates, stamps, and serializes
@@ -179,34 +178,17 @@ How the SDK reacts when it cannot deliver:
 - Platforms without a login id keep their random fallback id across key
   rotations: it now lives at `Saved/QueryRig/device_id`.
 
-## Local development
-
-Run the SDK conformance harness from the queryrig repo (`npm run
-sdk-harness`, port 8788) and point `Saved/Config/queryrig.json` at
-`http://127.0.0.1:8788/v1/events` with key `test-key`.
-
-## Conformance test
+## Tests
 
 The plugin ships an editor-only `QueryRigConformance` module (never packaged
-into games) with a commandlet that exercises the spec end to end. With the
-harness running and a **disposable C++ host project** that enables the plugin:
-
-The runner clears that host's local QueryRig queue and rewrites
-`Saved/Config/queryrig.json`. Never run it against a real game's saved data.
-
-```
-UnrealEditor-Cmd.exe <Host.uproject> -run=QueryRigConformance -unattended -nullrhi -nosplash -stdout
-```
-
-Covers delivery + stamping (including the hashed player id), an outage (zero
-loss, zero duplicates after disk-queue replay), an edge 403 treated as
-permanent without losing the batch, an unresolvable host backed off as a
-network error (live and at cold start), inert startup with a missing or
-non-HTTPS endpoint, the remote kill switch both directions, and hard-off
-silence. Exit code 0 on pass, 2 if the harness is unreachable.
-
-Also checks immutable nested properties, UTF-8 batch limits, and persistence
-of pending/in-flight events during shutdown.
+into games) with a commandlet run before each release. It covers delivery and
+stamping (including the hashed player id), an outage (zero loss, zero
+duplicates after disk-queue replay), an edge 403 treated as permanent without
+losing the batch, an unresolvable host backed off as a network error (live and
+at cold start), inert startup with a missing or non-HTTPS endpoint, the remote
+kill switch in both directions, hard-off silence, immutable nested properties,
+UTF-8 batch limits, and persistence of pending and in-flight events during
+shutdown. It runs against QueryRig's SDK test server, which is not public.
 
 ## Packaging
 
